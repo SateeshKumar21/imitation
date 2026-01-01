@@ -1,0 +1,105 @@
+from imitation.utils.general_utils import AttrDict
+from imitation.algo.dynamics_model import ReconstructionDynamicsModel, ReconstructionInverseDynamicsModel
+from imitation.models.distribution_nets import MDN, Gaussian
+from imitation.models.image_nets import ResNet18, ResNet34, SpatialSoftmax, R3M, VisionTransformer
+from imitation.models.obs_nets import VisionCore, LowDimCore
+from imitation.data.dataset_old import SequenceDatasetMultiFile
+import torch.nn as nn
+from collections import OrderedDict
+
+train_config = AttrDict(
+    output_dir="/home/shivin/Desktop/imitation/experiments/",
+    batch_size=64,
+    num_epochs=1000,
+    epoch_every_n_steps=500,
+    log_every_n_epochs=1,
+    val_every_n_epochs=10,
+    save_every_n_epochs=25,
+    eval_every_n_epochs=-1,
+    seed=1
+)
+
+data_config = AttrDict(
+    data=["/home/shivin/Desktop/imitation/data/old/color_lift_n300_fixed_sides_random_init.h5"],
+    dataset_class=SequenceDatasetMultiFile,
+    dataset_kwargs=dict(
+        seq_length=2,
+        pad_seq_length=True,
+        frame_stack=1,
+        pad_frame_stack=True,
+        dataset_keys=['actions'],
+        hdf5_cache_mode='all',
+        hdf5_use_swmr=True
+    ),
+    num_workers=2
+)
+
+policy_config = AttrDict(
+    policy_class=ReconstructionInverseDynamicsModel,
+    latent_dim=256,
+    hidden_units=[128, 128],
+    action_normalization_type='gaussian',
+)
+
+observation_config = AttrDict(
+    obs = OrderedDict(
+        low_dim = [
+            "robot0_eef_pos",
+            "robot0_eef_quat",
+            "robot0_gripper_qpos",
+            # "reference_cube_color",
+            "object-state"
+        ],
+        rgb = [
+            # "agentview_image",
+            # "sideview_image,"
+            # "robot0_eye_in_hand_image",
+        ],
+        depth = [],
+    ),
+    obs_keys_to_normalize = {
+        "robot0_eef_pos": 'gaussian',
+        "robot0_eef_quat": 'gaussian',
+        "robot0_gripper_qpos": 'gaussian',
+    },
+    encoder = AttrDict(
+        low_dim = AttrDict(
+            core_class=None,#LowDimCore,
+            core_kwargs=dict(
+                output_dim=16,
+                hidden_units=[16],
+                activation=nn.LeakyReLU(0.2),
+                output_activation=nn.LeakyReLU(0.2),
+            ),
+        ),
+        rgb = AttrDict(
+            core_class=VisionCore,
+            core_kwargs=dict(
+                backbone_class=ResNet18,
+                backbone_kwargs=None,
+                feature_dim=128,
+                pool_class=None,
+                pool_kwargs=dict(
+                    num_kp=32,
+                    learnable_temperature=False,
+                    temperature=1.0,
+                    noise_std=0.0,
+                ),
+            ),
+        ),
+        depth = AttrDict(
+            core_class=None,
+            core_kwargs=dict(),
+        ),
+    )
+)
+
+evaluator_config = None
+
+config = AttrDict(
+    train_config=train_config,
+    data_config=data_config,
+    observation_config=observation_config,
+    policy_config=policy_config,
+    evaluator_config=evaluator_config,
+)
