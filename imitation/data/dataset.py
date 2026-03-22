@@ -15,6 +15,11 @@ from imitation.utils.general_utils import AttrDict
 from imitation.utils.tensor_utils import pad_sequence
 from imitation.utils.obs_utils import process_obs_dict
 
+import numpy as np
+import torch
+
+
+
 
 # adapted from robomimic: https://github.com/ARISE-Initiative/robomimic.git
 class SequenceDataset(torch.utils.data.Dataset):
@@ -373,3 +378,63 @@ class SequenceDataset(torch.utils.data.Dataset):
         traj['actions'] = traj['actions'].take(action_chunk_indices, axis=0)
 
         return traj
+
+
+class WeightedMultiDataset(SequenceDataset):
+    def __init__(
+        self,
+        data_paths,  # Expecting exactly 2 paths
+        obs_keys_to_modality,
+        dataset_keys,
+        target_prob=0.5,  # Probability of sampling from the first file
+        **kwargs
+    ):
+        assert len(data_paths) == 2, "This class expects exactly two HDF5 file paths."
+        
+        super().__init__(
+            data_paths=data_paths,
+            obs_keys_to_modality=obs_keys_to_modality,
+            dataset_keys=dataset_keys,
+            **kwargs
+        )
+        
+        self.target_prob = target_prob
+        
+        # Separate the indices by file_id for sampling
+        self.file_0_indices = [idx for idx, f_id in self._index_to_file_id.items() if f_id == 0]
+        self.file_1_indices = [idx for idx, f_id in self._index_to_file_id.items() if f_id == 1]
+        
+        # Adjust for split if necessary
+        if self.split == 'train':
+            self.file_0_indices = [i for i in self.file_0_indices if i < self.train_split]
+            self.file_1_indices = [i for i in self.file_1_indices if i < self.train_split]
+        elif self.split == 'val':
+            # Note: SequenceDataset shifts index in __getitem__ for 'val', 
+            # so we store the raw indices here.
+            self.file_0_indices = [i for i in self.file_0_indices if i >= self.train_split]
+            self.file_1_indices = [i for i in self.file_1_indices if i >= self.train_split]
+
+    def __getitem__(self, index):
+        """
+        Overrides the standard indexing. Instead of using the passed 'index',
+        it uses the index as a seed/trigger to sample from one of the two files
+        based on the defined probability.
+
+        """
+        #import pdb; pdb.set_trace()
+        # Determine which file to sample from
+        if np.random.rand() < self.target_prob:
+            # Sample a random index from the first file's available indices
+          #  print("Sampling from file 0")
+            sampled_idx = np.random.choice(self.file_0_indices)
+        else:
+            # Sample a random index from the second file
+           # print("Sampling from file 1")
+            sampled_idx = np.random.choice(self.file_1_indices)
+
+        # Handle the internal 'val' offset logic from the parent class
+        if self.split == 'val':
+            # The parent get_item expects a relative index for val
+            return self.get_item(sampled_idx - self.train_split)
+            
+        return self.get_item(sampled_idx)

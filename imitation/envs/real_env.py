@@ -80,41 +80,37 @@ class TiagoGym(gym.Env):
         super().__init__()
         self.hdf5_object = h5py.File(data_dir, 'r')
         self.demo_index = demo_index
-        if 'data' in self.hdf5_object:
-            self.num_samples = self.hdf5_object[f'data/demo_{self.demo_index}/obs/tiago_head_image'].shape[0]
-        else:
-            self.num_samples = self.hdf5_object[f'obs/tiago_head_image'].shape[0]
-        self.curr_index = -1 
         self.h5_prefix = f'data/demo_{self.demo_index}/' if 'data' in self.hdf5_object else ''
 
-        # 1. Be very explicit with shapes and dtypes here
-        self.observation_space = spaces.Dict({
-            'left': spaces.Box(
-                low=-np.inf, 
-                high=np.inf, 
-                shape=(8,), 
-                dtype=np.float32
-            ),
-            'tiago_head_image': spaces.Box(
-                low=0.0, 
-                high=255.0, 
-                shape=(480, 480, 3), 
-                dtype=np.float16
-            )
-        })
-        
-        self.action_space = spaces.Box(low=-1, high=1, shape=(8,), dtype=np.float32)
+        obs_group = self.hdf5_object[f'{self.h5_prefix}obs']
+        self.obs_keys = list(obs_group.keys())
+
+        first_key = self.obs_keys[0]
+        self.num_samples = obs_group[first_key].shape[0]
+        self.curr_index = -1
+
+        obs_spaces = {}
+        for key in self.obs_keys:
+            ds = obs_group[key]
+            shape = ds.shape[1:]
+            dtype = ds.dtype
+            if 'image' in key:
+                obs_spaces[key] = spaces.Box(low=0.0, high=255.0, shape=shape, dtype=dtype)
+            else:
+                obs_spaces[key] = spaces.Box(low=-np.inf, high=np.inf, shape=shape, dtype=np.float64)
+        self.observation_space = spaces.Dict(obs_spaces)
+
+        action_ds = self.hdf5_object[f'{self.h5_prefix}actions']
+        action_dim = action_ds.shape[1]
+        self.action_space = spaces.Box(low=-1, high=1, shape=(action_dim,), dtype=np.float32)
 
     def _observation(self):
-        # 2. Use .reshape() and .astype() to guarantee the shape matches the space exactly
-        left_data = self.hdf5_object[f'{self.h5_prefix}obs/left'][self.curr_index]
-        image_data = self.hdf5_object[f'{self.h5_prefix}obs/tiago_head_image'][self.curr_index]
-       
-        #import pdb; pdb.set_trace()
-        return {
-            'left': np.array(left_data, dtype=np.float64).reshape(8,),
-            'tiago_head_image': np.array(image_data, dtype=np.float16).reshape(480, 480, 3)
-        }
+        obs_group = self.hdf5_object[f'{self.h5_prefix}obs']
+        obs = {}
+        for key in self.obs_keys:
+            data = obs_group[key][self.curr_index]
+            obs[key] = np.array(data)
+        return obs
 
     def step(self, action):
         # Gymnasium step returns: obs, reward, terminated, truncated, info
