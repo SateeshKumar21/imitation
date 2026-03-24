@@ -201,7 +201,7 @@ class Trainer:
         
         if self.train_config.val_every_n_epochs > 0:
             self.val_loader = DataLoader(
-                                self.train_dataset, 
+                                self.val_dataset,
                                 batch_size=self.train_config.batch_size,
                                 shuffle=True,
                                 num_workers=self.data_config.num_workers)
