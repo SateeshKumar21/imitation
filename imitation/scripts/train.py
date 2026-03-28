@@ -18,25 +18,41 @@ WANDB_ENTITY_NAME = 'sakumar'
 
 class Trainer:
 
-    def __init__(self, config_path, exp_name):
+    def __init__(self, config_path, exp_name, resume_path=None):
         self.config_path = config_path
         self.exp_name = exp_name
         self.load_config(config_path)
-        
+
         self.create_log()
         self.setup_data()
         self.setup_model()
 
+        self.start_epoch = 0
+        if resume_path is not None:
+            self.load_checkpoint(resume_path)
+
         self.evaluator = None
         if self.evaluator_config:
             self.evaluator = self.evaluator_config.evaluator(eval_config=self.evaluator_config, trainer=self)
+
+    def load_checkpoint(self, path):
+        print(f"==> Resuming from checkpoint: {path}")
+        _, state = torch.load(path, weights_only=False)
+        self.model.load_state_dict(state)
+        # parse epoch from filename, e.g. weights_ep100.pth
+        basename = os.path.basename(path)
+        try:
+            self.start_epoch = int(basename.split('ep')[1].split('.')[0])
+            print(f"==> Resuming from epoch {self.start_epoch}")
+        except (IndexError, ValueError):
+            self.start_epoch = 0
 
     def train(self, n_epochs):
         self.model.train()
         # Visualize at start of training
         if self.log_path is not None:
             self.visualize_training_images(0)
-        for epoch in range(n_epochs):
+        for epoch in range(self.start_epoch, n_epochs):
             epoch_info = self.train_epoch(epoch)
             self.model.post_epoch_update()
             
@@ -291,7 +307,8 @@ if __name__=='__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, help="path to the config file")
     parser.add_argument("--exp_name", type=str, help="unique name of the current run(include details of the architecture. eg. SimpleC2R_64x3_relu_run1)")
+    parser.add_argument("--resume", type=str, default=None, help="path to a checkpoint .pth file to resume training from")
     args = parser.parse_args()
 
-    trainer = Trainer(config_path=args.config, exp_name=args.exp_name)
+    trainer = Trainer(config_path=args.config, exp_name=args.exp_name, resume_path=args.resume)
     trainer.train(n_epochs=trainer.train_config.num_epochs)

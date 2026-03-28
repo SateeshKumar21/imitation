@@ -24,7 +24,7 @@ train_config = AttrDict(
 
 data_config = AttrDict(
     data=[
-        "/home/ec2-user/dec_21_processed/processed_il_data/processed_il_data/data_0_to_8.h5"
+        "/home/ec2-user/augmented_il_data_jan_5_v1_100/augmented_v1_100.h5"
         # "/mnt/hdd2/libero/libero_10/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_demo.hdf5",
         # "/mnt/hdd2/libero/libero_10/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it_demo.hdf5",
         # "/mnt/hdd2/libero/libero_10/KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it_demo.hdf5",
@@ -125,7 +125,7 @@ observation_config = AttrDict(
                 AttrDict(
                     aug_class=TranslationAug,
                     aug_kwargs=dict(
-                        translation=15
+                        translation=24
                     )
                 ),
                 AttrDict(
