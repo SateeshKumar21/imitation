@@ -1,6 +1,7 @@
 import os
 from tqdm import tqdm
 import torch
+import numpy as np
 from torch.utils.data import DataLoader
 from imitation.utils.general_utils import AttrDict
 from imitation.utils.obs_utils import process_obs_dict
@@ -32,6 +33,9 @@ class Trainer:
 
     def train(self, n_epochs):
         self.model.train()
+        # Visualize at start of training
+        if self.log_path is not None:
+            self.visualize_training_images(0)
         for epoch in range(n_epochs):
             epoch_info = self.train_epoch(epoch)
             self.model.post_epoch_update()
@@ -60,6 +64,8 @@ class Trainer:
 
             if self.train_config.save_every_n_epochs > 0 and (epoch+1) % self.train_config.save_every_n_epochs == 0:
                 self.save_checkpoint(epoch+1)
+                if self.log_path is not None:
+                    self.visualize_training_images(epoch+1)
 
     def train_epoch(self, epoch):
         
@@ -158,6 +164,61 @@ class Trainer:
         if self.log_path is not None:
             print(f"==> Saving checkpoint at epoch {epoch}")
             self.model.save_weights(epoch, self.log_path)
+
+    def visualize_training_images(self, epoch):
+        """Save a grid of training images (original vs augmented) to disk."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        vis_dir = os.path.join(self.log_path, 'training_vis')
+        os.makedirs(vis_dir, exist_ok=True)
+
+        rgb_keys = [k for k, v in self.obs_key_to_modality.items() if v == 'rgb']
+        if not rgb_keys:
+            return
+
+        # Grab one batch
+        batch = next(iter(self.train_loader))
+        batch['obs'] = process_obs_dict(batch['obs'], self.obs_key_to_modality)
+        batch = recursive_dict_list_tuple_apply(batch, {torch.Tensor: lambda x: x.to(DEVICE).float()})
+
+        obs_encoder = self.model.nets["obs_encoder"]
+        n_show = min(4, batch['obs'][rgb_keys[0]].shape[0])
+
+        for rgb_key in rgb_keys:
+            images = batch['obs'][rgb_key][:n_show]  # (N, T, C, H, W)
+            T = images.shape[1]
+
+            # Apply augmentation
+            obs_encoder.train()
+            with torch.no_grad():
+                aug_images = obs_encoder.apply_augmentation(rgb_key, images.clone())
+
+            fig, axes = plt.subplots(n_show * 2, T, figsize=(3 * T, 2.5 * n_show * 2))
+            if T == 1:
+                axes = axes[:, None]
+
+            for s in range(n_show):
+                for t in range(T):
+                    orig = images[s, t].detach().cpu().numpy().transpose(1, 2, 0)
+                    orig = (orig * 255).clip(0, 255).astype(np.uint8)
+                    axes[s * 2, t].imshow(orig)
+                    axes[s * 2, t].set_title(f's{s} t{t} original', fontsize=7)
+                    axes[s * 2, t].axis('off')
+
+                    aug = aug_images[s, t].detach().cpu().numpy().transpose(1, 2, 0)
+                    aug = (aug * 255).clip(0, 255).astype(np.uint8)
+                    axes[s * 2 + 1, t].imshow(aug)
+                    axes[s * 2 + 1, t].set_title(f's{s} t{t} augmented', fontsize=7)
+                    axes[s * 2 + 1, t].axis('off')
+
+            plt.suptitle(f'Epoch {epoch} | {rgb_key} | original vs augmented', fontsize=10)
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            out_path = os.path.join(vis_dir, f'epoch_{epoch}_{rgb_key}.png')
+            plt.savefig(out_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"Saved training vis: {out_path}")
 
     def load_config(self, config_path):
         self.conf = SourceFileLoader('conf', config_path).load_module().config

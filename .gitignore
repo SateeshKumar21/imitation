@@ -5,4 +5,6 @@ __pycache__
 *.json
 *.pkl
 *experiments/
-export/
+export*
+test*
+config*
