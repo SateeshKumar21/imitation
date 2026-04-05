@@ -418,20 +418,25 @@ class WeightedMultiDataset(SequenceDataset):
         )
         
         self.target_prob = target_prob
-        
+
         # Separate the indices by file_id for sampling
-        self.file_0_indices = [idx for idx, f_id in self._index_to_file_id.items() if f_id == 0]
-        self.file_1_indices = [idx for idx, f_id in self._index_to_file_id.items() if f_id == 1]
-        
-        # Adjust for split if necessary
+        all_file_0 = sorted([idx for idx, f_id in self._index_to_file_id.items() if f_id == 0])
+        all_file_1 = sorted([idx for idx, f_id in self._index_to_file_id.items() if f_id == 1])
+
+        # Split each file independently at 95% so the smaller dataset always
+        # contributes val samples regardless of the global train_split boundary.
+        file_0_train_end = int(self.SPLIT.train * len(all_file_0))
+        file_1_train_end = int(self.SPLIT.train * len(all_file_1))
+
         if self.split == 'train':
-            self.file_0_indices = [i for i in self.file_0_indices if i < self.train_split]
-            self.file_1_indices = [i for i in self.file_1_indices if i < self.train_split]
+            self.file_0_indices = all_file_0[:file_0_train_end]
+            self.file_1_indices = all_file_1[:file_1_train_end]
         elif self.split == 'val':
-            # Note: SequenceDataset shifts index in __getitem__ for 'val', 
-            # so we store the raw indices here.
-            self.file_0_indices = [i for i in self.file_0_indices if i >= self.train_split]
-            self.file_1_indices = [i for i in self.file_1_indices if i >= self.train_split]
+            self.file_0_indices = all_file_0[file_0_train_end:]
+            self.file_1_indices = all_file_1[file_1_train_end:]
+        else:
+            self.file_0_indices = all_file_0
+            self.file_1_indices = all_file_1
 
     def __getitem__(self, index):
         """
@@ -441,19 +446,16 @@ class WeightedMultiDataset(SequenceDataset):
 
         """
         #import pdb; pdb.set_trace()
-        # Determine which file to sample from
-        if np.random.rand() < self.target_prob:
-            # Sample a random index from the first file's available indices
-          #  print("Sampling from file 0")
+        # Determine which file to sample from, falling back if one split is empty
+        file_0_empty = len(self.file_0_indices) == 0
+        file_1_empty = len(self.file_1_indices) == 0
+        if file_0_empty:
+            sampled_idx = np.random.choice(self.file_1_indices)
+        elif file_1_empty:
+            sampled_idx = np.random.choice(self.file_0_indices)
+        elif np.random.rand() < self.target_prob:
             sampled_idx = np.random.choice(self.file_0_indices)
         else:
-            # Sample a random index from the second file
-           # print("Sampling from file 1")
             sampled_idx = np.random.choice(self.file_1_indices)
 
-        # Handle the internal 'val' offset logic from the parent class
-        if self.split == 'val':
-            # The parent get_item expects a relative index for val
-            return self.get_item(sampled_idx - self.train_split)
-            
         return self.get_item(sampled_idx)
