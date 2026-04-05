@@ -1,6 +1,7 @@
 import os
 from tqdm import tqdm
 import torch
+import torch.cuda.amp as amp
 import numpy as np
 from torch.utils.data import DataLoader
 from imitation.utils.general_utils import AttrDict
@@ -11,6 +12,7 @@ from imitation.utils.file_utils import get_all_obs_keys_from_config, get_shape_m
 from importlib.machinery import SourceFileLoader
 
 DEVICE = 'cuda'
+torch.set_float32_matmul_precision('high')  # enable TF32 on Ampere/Ada GPUs
 
 LOG = True
 WANDB_PROJECT_NAME = '3dmoma'
@@ -99,8 +101,8 @@ class Trainer:
                 data_loader_iter = iter(self.train_loader)
                 batch = next(data_loader_iter)
             #import pdb; pdb.set_trace()
+            batch = recursive_dict_list_tuple_apply(batch, {torch.Tensor: lambda x: x.to(DEVICE, non_blocking=True).float()})
             batch['obs'] = process_obs_dict(batch['obs'], self.obs_key_to_modality)
-            batch = recursive_dict_list_tuple_apply(batch, {torch.Tensor: lambda x: x.to(DEVICE).float()})
             
             # batchnorm doesn't work with batch size 1 
             if batch['actions'].shape[0] == 1:
@@ -109,16 +111,27 @@ class Trainer:
             for i in range(len(self.optimizers)):
                 self.optimizers[i].zero_grad()
 
-            losses = self.model.compute_loss(batch)
-            losses.total.backward()
+            with torch.autocast(device_type='cuda', dtype=self.amp_dtype):
+                losses = self.model.compute_loss(batch)
+
+            if self.scaler is not None:
+                self.scaler.scale(losses.total).backward()
+            else:
+                losses.total.backward()
 
             # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
             for i in range(len(self.optimizers)):
-                self.optimizers[i].step()
-                
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizers[i])
+                else:
+                    self.optimizers[i].step()
+
                 if self.lr_schedulers[i] is not None:
                     self.lr_schedulers[i].step()
+
+            if self.scaler is not None:
+                self.scaler.update()
 
             self.model.post_step_update()
 
@@ -128,8 +141,9 @@ class Trainer:
                     epoch_info.losses[k] = 0
                 epoch_info.losses[k] += float(losses[k].item())/self.train_config.epoch_every_n_steps
 
-            epoch_info.gradient_norm += torch.mean(torch.stack([torch.norm(p.grad.data) for p in self.model.parameters() if p.grad is not None]))/self.train_config.epoch_every_n_steps
-            epoch_info.weight_norm += torch.mean(torch.stack([torch.norm(p.data) for p in self.model.parameters() if p.grad is not None]))/self.train_config.epoch_every_n_steps
+        # compute norms once at end of epoch (grads from last step are still valid)
+        epoch_info.gradient_norm = torch.mean(torch.stack([torch.norm(p.grad.data) for p in self.model.parameters() if p.grad is not None]))
+        epoch_info.weight_norm = torch.mean(torch.stack([torch.norm(p.data) for p in self.model.parameters() if p.grad is not None]))
 
         return epoch_info
 
@@ -142,8 +156,8 @@ class Trainer:
             val_loss = AttrDict()
 
             for batch in tqdm(self.val_loader):
+                batch = recursive_dict_list_tuple_apply(batch, {torch.Tensor: lambda x: x.to(DEVICE, non_blocking=True).float()})
                 batch['obs'] = process_obs_dict(batch['obs'], self.obs_key_to_modality)
-                batch = recursive_dict_list_tuple_apply(batch, {torch.Tensor: lambda x: x.to(DEVICE).float()})
 
                 losses = self.model.compute_loss(batch)
 
@@ -271,17 +285,23 @@ class Trainer:
     
     def setup_dataloader(self):
         self.train_loader = DataLoader(
-                                self.train_dataset, 
+                                self.train_dataset,
                                 batch_size=self.train_config.batch_size,
                                 shuffle=True,
-                                num_workers=self.data_config.num_workers)
-        
+                                num_workers=self.data_config.num_workers,
+                                pin_memory=True,
+                                persistent_workers=self.data_config.num_workers > 0,
+                                prefetch_factor=2 if self.data_config.num_workers > 0 else None)
+
         if self.train_config.val_every_n_epochs > 0:
             self.val_loader = DataLoader(
                                 self.val_dataset,
                                 batch_size=self.train_config.batch_size,
                                 shuffle=True,
-                                num_workers=self.data_config.num_workers)
+                                num_workers=self.data_config.num_workers,
+                                pin_memory=True,
+                                persistent_workers=self.data_config.num_workers > 0,
+                                prefetch_factor=2 if self.data_config.num_workers > 0 else None)
 
     def setup_model(self):
         model_config = AttrDict(
@@ -300,6 +320,17 @@ class Trainer:
             epoch_every_n_steps=self.train_config.epoch_every_n_steps
         )
         assert len(self.optimizers) == len(self.lr_schedulers), 'Number of optimizers and learning rate schedulers should be same'
+
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            self.amp_dtype = torch.bfloat16
+            self.scaler = None  # bfloat16 doesn't need GradScaler
+        else:
+            self.amp_dtype = torch.float16
+            self.scaler = amp.GradScaler()
+
+        if hasattr(torch, 'compile'):
+            print("==> Compiling compute_loss with torch.compile...")
+            self.model.compute_loss = torch.compile(self.model.compute_loss, mode='reduce-overhead')
 
 if __name__=='__main__':
     import argparse

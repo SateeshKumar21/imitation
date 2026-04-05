@@ -33,7 +33,8 @@ class SequenceDataset(torch.utils.data.Dataset):
         window_size=1,
         action_horizon=1,
         obs_keys_to_normalize={},
-        split='train'
+        split='train',
+        demo_ids=None,
     ):
         """
         Dataset class for fetching sequences of experience.
@@ -61,6 +62,8 @@ class SequenceDataset(torch.utils.data.Dataset):
 
         self.window_size = window_size
         self.action_horizon = action_horizon
+
+        self.demo_ids = set(demo_ids) if demo_ids is not None else None
 
         self.load_demo_info()
 
@@ -107,6 +110,10 @@ class SequenceDataset(torch.utils.data.Dataset):
             # sort demo keys
             inds = np.argsort([int(elem[5:]) for elem in self.demos[-1]])
             self.demos[-1] = [self.demos[-1][i] for i in inds]
+
+            if self.demo_ids is not None:
+                allowed = {f"demo_{i}" for i in self.demo_ids}
+                self.demos[-1] = [d for d in self.demos[-1] if d in allowed]
 
             self.n_demos += len(self.demos[-1])
             
@@ -365,17 +372,29 @@ class SequenceDataset(torch.utils.data.Dataset):
         timestep_pad_mask = history_ids >= 0 # True if timestep is valid
         history_ids = np.maximum(history_ids, 0)
 
+        unique_ids, inverse = np.unique(history_ids, return_inverse=True)
+        sorted_unique = unique_ids.tolist()
         for k in self.obs_keys:
-            traj['obs'][k] = self.get_dataset_for_ep(file_id, demo_id, f"obs/{k}")[:]
-            traj['obs'][k] = traj['obs'][k][history_ids]
+            data = self.get_dataset_for_ep(file_id, demo_id, f"obs/{k}")
+            if isinstance(data, np.ndarray):
+                traj['obs'][k] = data[history_ids]
+            else:
+                # h5py requires strictly increasing indices; deduplicate then remap
+                traj['obs'][k] = data[sorted_unique][inverse]
 
         traj['obs']['timestep_pad_mask'] = timestep_pad_mask
-        
+
         action_chunk_indices = history_ids[:, None] + np.arange(self.action_horizon)
         action_chunk_indices = np.minimum(action_chunk_indices, demo_length - 1)
 
-        traj['actions'] = self.get_dataset_for_ep(file_id, demo_id, "actions")[:]
-        traj['actions'] = traj['actions'].take(action_chunk_indices, axis=0)
+        actions_data = self.get_dataset_for_ep(file_id, demo_id, "actions")
+        if isinstance(actions_data, np.ndarray):
+            traj['actions'] = actions_data.take(action_chunk_indices, axis=0)
+        else:
+            flat = action_chunk_indices.flatten()
+            unique_act_ids, act_inverse = np.unique(flat, return_inverse=True)
+            actions_subset = actions_data[unique_act_ids.tolist()]
+            traj['actions'] = actions_subset[act_inverse].reshape(action_chunk_indices.shape + actions_subset.shape[1:])
 
         return traj
 
