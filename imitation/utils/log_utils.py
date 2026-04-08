@@ -44,7 +44,7 @@ class WandBLogger:
         """
         if exclude is None: exclude = []
         flat_config = flatten_dict(conf)
-        filtered_config = {k: v for k, v in flat_config.items() if (k not in exclude and not inspect.isclass(v))}
+        filtered_config = {k: (v.__name__ if inspect.isclass(v) else v) for k, v in flat_config.items() if k not in exclude}
         self.log_path = path
         print("INIT WANDB")
         wandb.init(
