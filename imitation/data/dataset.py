@@ -402,26 +402,26 @@ class SequenceDataset(torch.utils.data.Dataset):
 class WeightedMultiDataset(SequenceDataset):
     def __init__(
         self,
-        data_paths,  # Expecting exactly 2 paths
+        data_paths,  # First path is real data; remaining are gen data
         obs_keys_to_modality,
         dataset_keys,
-        target_prob=0.5,  # Probability of sampling from the first file
+        target_prob=0.5,  # Probability of sampling from the first (real) file
         **kwargs
     ):
-        assert len(data_paths) == 2, "This class expects exactly two HDF5 file paths."
-        
+        assert len(data_paths) >= 2, "This class expects at least two HDF5 file paths."
+
         super().__init__(
             data_paths=data_paths,
             obs_keys_to_modality=obs_keys_to_modality,
             dataset_keys=dataset_keys,
             **kwargs
         )
-        
+
         self.target_prob = target_prob
 
-        # Separate the indices by file_id for sampling
+        # file_id=0 is real data; all others are gen data
         all_file_0 = sorted([idx for idx, f_id in self._index_to_file_id.items() if f_id == 0])
-        all_file_1 = sorted([idx for idx, f_id in self._index_to_file_id.items() if f_id == 1])
+        all_file_1 = sorted([idx for idx, f_id in self._index_to_file_id.items() if f_id != 0])
 
         # Split each file independently at 95% so the smaller dataset always
         # contributes val samples regardless of the global train_split boundary.
