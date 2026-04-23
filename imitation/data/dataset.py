@@ -419,43 +419,42 @@ class WeightedMultiDataset(SequenceDataset):
 
         self.target_prob = target_prob
 
-        # file_id=0 is real data; all others are gen data
-        all_file_0 = sorted([idx for idx, f_id in self._index_to_file_id.items() if f_id == 0])
-        all_file_1 = sorted([idx for idx, f_id in self._index_to_file_id.items() if f_id != 0])
-
-        # Split each file independently at 95% so the smaller dataset always
-        # contributes val samples regardless of the global train_split boundary.
-        file_0_train_end = int(self.SPLIT.train * len(all_file_0))
-        file_1_train_end = int(self.SPLIT.train * len(all_file_1))
+        # Split each file's indices independently at 95% so each file always
+        # contributes val samples regardless of its size relative to the others.
+        # file_id=0 is real data; all others (file_id>=1) form a combined gen pool.
+        per_file_train = []
+        per_file_val = []
+        num_files = len(data_paths)
+        for fid in range(num_files):
+            all_idx = sorted([idx for idx, f_id in self._index_to_file_id.items() if f_id == fid])
+            train_end = int(self.SPLIT.train * len(all_idx))
+            per_file_train.append(all_idx[:train_end])
+            per_file_val.append(all_idx[train_end:])
 
         if self.split == 'train':
-            self.file_0_indices = all_file_0[:file_0_train_end]
-            self.file_1_indices = all_file_1[:file_1_train_end]
+            self.real_indices = per_file_train[0]
+            self.gen_indices = [i for sub in per_file_train[1:] for i in sub]
         elif self.split == 'val':
-            self.file_0_indices = all_file_0[file_0_train_end:]
-            self.file_1_indices = all_file_1[file_1_train_end:]
+            self.real_indices = per_file_val[0]
+            self.gen_indices = [i for sub in per_file_val[1:] for i in sub]
         else:
-            self.file_0_indices = all_file_0
-            self.file_1_indices = all_file_1
+            self.real_indices = per_file_train[0] + per_file_val[0]
+            self.gen_indices = [i for sub in (per_file_train[1:] + per_file_val[1:]) for i in sub]
 
     def __getitem__(self, index):
         """
-        Overrides the standard indexing. Instead of using the passed 'index',
-        it uses the index as a seed/trigger to sample from one of the two files
-        based on the defined probability.
-
+        Samples from real data (file 0) with prob target_prob, otherwise from the
+        combined gen data pool (files 1..N). Falls back if one pool is empty.
         """
-        #import pdb; pdb.set_trace()
-        # Determine which file to sample from, falling back if one split is empty
-        file_0_empty = len(self.file_0_indices) == 0
-        file_1_empty = len(self.file_1_indices) == 0
-        if file_0_empty:
-            sampled_idx = np.random.choice(self.file_1_indices)
-        elif file_1_empty:
-            sampled_idx = np.random.choice(self.file_0_indices)
+        real_empty = len(self.real_indices) == 0
+        gen_empty = len(self.gen_indices) == 0
+        if real_empty:
+            sampled_idx = np.random.choice(self.gen_indices)
+        elif gen_empty:
+            sampled_idx = np.random.choice(self.real_indices)
         elif np.random.rand() < self.target_prob:
-            sampled_idx = np.random.choice(self.file_0_indices)
+            sampled_idx = np.random.choice(self.real_indices)
         else:
-            sampled_idx = np.random.choice(self.file_1_indices)
+            sampled_idx = np.random.choice(self.gen_indices)
 
         return self.get_item(sampled_idx)

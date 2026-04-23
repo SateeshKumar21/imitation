@@ -1,6 +1,11 @@
 """
 Evaluate a trained model at uniformly spaced steps across demos in an HDF5 dataset.
 
+Mirrors the observation / call pattern used in rollout_diffusion_policy.py so the
+MSE numbers reflect what the rollout loop actually sees:
+  * model.get_action(obs, batched=False, execute_horizon=execute_horizon).reshape(-1,)
+  * optional inverse transform of camera-frame policy outputs back into torso frame
+
 Reads the config to determine:
   - data path(s)
   - observation keys + modalities
@@ -12,11 +17,19 @@ and evaluates it against ground truth actions.
 Usage:
     python -m imitation.scripts.evaluate_model --config <config_module_path> [options]
 
-Example:
+Examples:
+    # Basic evaluation, primary-frame MSE only
     python -m imitation.scripts.evaluate_model \
         --config imitation.config.model.diffusion_policy_ws5_27th_feb_exp3 \
-        --num_eval_points 10 \
-        --demos 11 12 13
+        --num_eval_points 10 --demos 11 12 13
+
+    # Dual-frame: main h5 (from config) has cam-frame GT; paired h5 has torso-frame GT.
+    # Reports MSE before (cam vs cam) and after inverse transform (torso vs torso).
+    python -m imitation.scripts.evaluate_model \
+        --config imitation.config.model.diffusion_policy_cam_exp \
+        --cam_actions \
+        --torso_actions_h5 /.../data_1_to_37_notp.h5 \
+        --execute_horizon 8
 """
 import argparse
 import importlib
@@ -28,6 +41,27 @@ from collections import deque, OrderedDict
 import h5py
 import numpy as np
 import torch
+
+ACTION_TRANSFORM_PATH = "/home/ec2-user/action-transformation"
+if ACTION_TRANSFORM_PATH not in sys.path:
+    sys.path.insert(0, ACTION_TRANSFORM_PATH)
+
+from calibration import T_BASE_TORSO, T_BASE_CAMERA
+from transform_il_data_to_camera_frame import invert_transform
+from inverse_transform_actions import inverse_transform_actions
+
+
+def _load_cam_torso_transform(calib_npz=None):
+    """Return T_cam_torso used to inverse-transform camera-frame policy actions."""
+    if calib_npz is not None:
+        d = np.load(calib_npz)
+        T_base_torso = np.asarray(d["T_base_torso"], dtype=np.float64)
+        T_base_camera = np.asarray(d["T_base_camera"], dtype=np.float64)
+    else:
+        T_base_torso = T_BASE_TORSO.copy()
+        T_base_camera = T_BASE_CAMERA.copy()
+    T_cam_base = invert_transform(T_base_camera)
+    return T_cam_base @ T_base_torso
 
 
 def find_checkpoint(experiment_dir, epoch=None):
@@ -101,8 +135,23 @@ def list_demos(hdf5_file):
     return demos
 
 
-def evaluate(config, ckpt_path, demo_indices, num_eval_points, verbose=True):
-    """Run evaluation and return results dict."""
+def evaluate(config, ckpt_path, demo_indices, num_eval_points,
+             execute_horizon=None, cam_actions=False, calib=None,
+             torso_actions_h5=None, verbose=True):
+    """Run evaluation and return results dict.
+
+    Mirrors the preprocessing / call pattern used in rollout_diffusion_policy.py:
+      * `model.get_action(obs, batched=False, execute_horizon=execute_horizon).reshape(-1,)`
+      * If `cam_actions`, inverse-transforms each prediction from camera frame to torso frame
+        using the calibration in action-transformation/calibration.py (or a --calib .npz).
+
+    Frame conventions:
+      * Main data h5 (from config): contains obs + GT actions in the **policy's training frame**.
+        The primary MSE is computed against these.
+      * `torso_actions_h5` (optional): paired h5 with the same demo keys/lengths but actions in
+        torso frame. When combined with `cam_actions`, computes a second "after transformation"
+        MSE of `inverse_transform(pred_cam)` vs torso-frame GT.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     policy_class = config.policy_config.policy_class
@@ -116,103 +165,193 @@ def evaluate(config, ckpt_path, demo_indices, num_eval_points, verbose=True):
     if isinstance(data_paths, str):
         data_paths = [data_paths]
 
+    T_cam_torso = None
+    if cam_actions:
+        T_cam_torso = _load_cam_torso_transform(calib)
+        if verbose:
+            print(f"[cam_actions] inverse-transforming camera-frame policy actions to torso frame "
+                  f"(calib={'builtin' if calib is None else calib})")
+
+    dual_frame = cam_actions and torso_actions_h5 is not None
+    torso_hdf5 = h5py.File(torso_actions_h5, "r") if torso_actions_h5 is not None else None
+    if dual_frame and verbose:
+        print(f"[dual_frame] also computing torso-frame MSE against {torso_actions_h5}")
+
     results = {}
 
-    for data_path in data_paths:
-        hdf5 = h5py.File(data_path, "r")
-        available_demos = list_demos(hdf5)
-        available_indices = [int(d.split("_")[-1]) for d in available_demos]
+    try:
+        for data_path in data_paths:
+            hdf5 = h5py.File(data_path, "r")
+            available_demos = list_demos(hdf5)
+            available_indices = [int(d.split("_")[-1]) for d in available_demos]
 
-        if demo_indices is not None:
-            run_indices = [i for i in demo_indices if i in available_indices]
-        else:
-            run_indices = available_indices
+            if demo_indices is not None:
+                run_indices = [i for i in demo_indices if i in available_indices]
+            else:
+                run_indices = available_indices
 
-        for demo_idx in run_indices:
-            demo_key = f"data/demo_{demo_idx}"
-            demo = hdf5[demo_key]
-            demo_len = demo["actions"].shape[0]
-            action_dim = demo["actions"].shape[1]
+            for demo_idx in run_indices:
+                demo_key = f"data/demo_{demo_idx}"
+                demo = hdf5[demo_key]
+                demo_len = demo["actions"].shape[0]
 
-            eval_indices = np.linspace(0, demo_len - 1, num_eval_points, dtype=int)
+                # Fetch paired torso-frame GT for this demo once, up front.
+                torso_demo_actions = None
+                if dual_frame:
+                    if demo_key not in torso_hdf5:
+                        if verbose:
+                            print(f"  [warn] {demo_key} missing from torso h5; skipping torso metric.")
+                    else:
+                        torso_demo_actions = torso_hdf5[demo_key]["actions"]
+                        if torso_demo_actions.shape[0] != demo_len:
+                            raise ValueError(f"{demo_key}: length mismatch main={demo_len} "
+                                             f"torso={torso_demo_actions.shape[0]}")
 
-            if verbose:
-                print(f"\n{'='*70}")
-                print(f"Demo {demo_idx} (length={demo_len}), eval at: {eval_indices.tolist()}")
-                print(f"{'='*70}")
-
-            predicted = []
-            gt_actions = []
-
-            for target_idx in eval_indices:
-                # Reset model queues for each eval point
-                model.obs_queue = deque(maxlen=n_obs_steps)
-                model.action_queue = deque()
-
-                # Feed a window of observations ending at target_idx
-                window_start = max(0, target_idx - n_obs_steps + 1)
-                for t in range(window_start, target_idx + 1):
-                    obs = {}
-                    for key in obs_keys:
-                        obs[key] = np.array(demo[f"obs/{key}"][t])
-                    with torch.no_grad():
-                        action = model.get_action(obs, batched=False)
-
-                gt_action = np.array(demo["actions"][target_idx])
-                pred_action = action.flatten()
-
-                predicted.append(pred_action)
-                gt_actions.append(gt_action)
+                eval_indices = np.linspace(0, demo_len - 1, num_eval_points, dtype=int)
 
                 if verbose:
-                    err = np.abs(pred_action - gt_action)
-                    fmt = lambda a: np.array2string(a, precision=4, suppress_small=True, max_line_width=200)
-                    print(f"  idx={target_idx:>4d}  pred={fmt(pred_action)}")
-                    print(f"          GT  ={fmt(gt_action)}")
-                    print(f"          |err|={fmt(err)}")
+                    print(f"\n{'='*70}")
+                    print(f"Demo {demo_idx} (length={demo_len}), eval at: {eval_indices.tolist()}")
+                    print(f"{'='*70}")
 
-            predicted = np.array(predicted)
-            gt_actions = np.array(gt_actions)
-            mse = float(np.mean((predicted - gt_actions) ** 2))
-            mae = float(np.mean(np.abs(predicted - gt_actions)))
-            per_dim_mse = np.mean((predicted - gt_actions) ** 2, axis=0)
+                predicted = []          # policy-frame (cam if cam_actions, else torso)
+                gt_actions = []         # matches frame of `predicted`
+                predicted_torso = []    # only populated when dual_frame
+                gt_torso = []
 
-            results[demo_idx] = {
-                "demo_len": demo_len,
-                "n_eval_points": len(eval_indices),
-                "mse": mse,
-                "mae": mae,
-                "per_dim_mse": per_dim_mse,
-            }
+                for target_idx in eval_indices:
+                    # Reset model queues for each eval point (independent evaluation).
+                    model.obs_queue = deque(maxlen=n_obs_steps)
+                    model.action_queue = deque()
 
-            if verbose:
-                print(f"  => MSE={mse:.6f}  MAE={mae:.6f}")
+                    # Feed a window of observations ending at target_idx
+                    window_start = max(0, target_idx - n_obs_steps + 1)
+                    for t in range(window_start, target_idx + 1):
+                        obs = {}
+                        for key in obs_keys:
+                            obs[key] = np.array(demo[f"obs/{key}"][t])
+                        with torch.no_grad():
+                            action = model.get_action(obs, batched=False,
+                                                      execute_horizon=execute_horizon)
 
-        hdf5.close()
+                    pred_action = np.asarray(action).reshape(-1,)
+                    gt_action = np.array(demo["actions"][target_idx])
+
+                    predicted.append(pred_action)
+                    gt_actions.append(gt_action)
+
+                    # Dual-frame: inverse-transform the camera-frame prediction into torso frame
+                    # and fetch the paired torso-frame GT.
+                    if dual_frame and torso_demo_actions is not None:
+                        pred_torso_vec = inverse_transform_actions(
+                            pred_action[None, :], T_cam_torso)[0].astype(pred_action.dtype)
+                        gt_torso_vec = np.array(torso_demo_actions[target_idx])
+                        predicted_torso.append(pred_torso_vec)
+                        gt_torso.append(gt_torso_vec)
+
+                    if verbose:
+                        err = np.abs(pred_action - gt_action)
+                        fmt = lambda a: np.array2string(a, precision=4, suppress_small=True, max_line_width=200)
+                        frame_tag = "cam" if cam_actions else "torso"
+                        print(f"  idx={target_idx:>4d}  pred[{frame_tag}]={fmt(pred_action)}")
+                        print(f"          GT  [{frame_tag}]={fmt(gt_action)}")
+                        print(f"          |err|       ={fmt(err)}")
+                        if dual_frame and predicted_torso:
+                            err_t = np.abs(predicted_torso[-1] - gt_torso[-1])
+                            print(f"          pred[torso]={fmt(predicted_torso[-1])}")
+                            print(f"          GT  [torso]={fmt(gt_torso[-1])}")
+                            print(f"          |err|      ={fmt(err_t)}")
+
+                predicted = np.array(predicted)
+                gt_actions = np.array(gt_actions)
+                mse = float(np.mean((predicted - gt_actions) ** 2))
+                mae = float(np.mean(np.abs(predicted - gt_actions)))
+                per_dim_mse = np.mean((predicted - gt_actions) ** 2, axis=0)
+
+                demo_result = {
+                    "demo_len": demo_len,
+                    "n_eval_points": len(eval_indices),
+                    "mse": mse,
+                    "mae": mae,
+                    "per_dim_mse": per_dim_mse,
+                    "frame": "cam" if cam_actions else "torso",
+                }
+
+                if dual_frame and predicted_torso:
+                    predicted_torso = np.array(predicted_torso)
+                    gt_torso = np.array(gt_torso)
+                    demo_result["mse_torso"] = float(np.mean((predicted_torso - gt_torso) ** 2))
+                    demo_result["mae_torso"] = float(np.mean(np.abs(predicted_torso - gt_torso)))
+                    demo_result["per_dim_mse_torso"] = np.mean((predicted_torso - gt_torso) ** 2, axis=0)
+
+                results[demo_idx] = demo_result
+
+                if verbose:
+                    line = f"  => [cam-frame ] MSE={mse:.6f}  MAE={mae:.6f}" if cam_actions \
+                           else f"  => MSE={mse:.6f}  MAE={mae:.6f}"
+                    print(line)
+                    if "mse_torso" in demo_result:
+                        print(f"  => [torso-frame] MSE={demo_result['mse_torso']:.6f}  "
+                              f"MAE={demo_result['mae_torso']:.6f}")
+
+            hdf5.close()
+    finally:
+        if torso_hdf5 is not None:
+            torso_hdf5.close()
 
     return results
 
 
 def print_summary(results):
-    """Print a formatted summary table."""
+    """Print a formatted summary table. If dual-frame metrics are present,
+    also print the torso-frame (after inverse transform) summary."""
     print(f"\n{'='*70}")
     print("SUMMARY")
     print(f"{'='*70}")
 
+    any_dual = any("mse_torso" in r for r in results.values())
+    primary_frame = next((r["frame"] for r in results.values() if "frame" in r), "policy")
+
+    header = f"{'Demo':>4s} {'len':>4s} | "
+    header += f"{primary_frame+'_MSE':>14s} {primary_frame+'_MAE':>14s}"
+    if any_dual:
+        header += f" | {'torso_MSE':>14s} {'torso_MAE':>14s}"
+    print(header)
+    print("-" * len(header))
+
     mses, maes, all_per_dim = [], [], []
+    mses_t, maes_t, all_per_dim_t = [], [], []
     for demo_idx in sorted(results.keys()):
         r = results[demo_idx]
-        print(f"  Demo {demo_idx:>3d} (len={r['demo_len']:>3d}): MSE={r['mse']:.6f}  MAE={r['mae']:.6f}")
+        row = f"{demo_idx:>4d} {r['demo_len']:>4d} | {r['mse']:>14.6f} {r['mae']:>14.6f}"
+        if any_dual and "mse_torso" in r:
+            row += f" | {r['mse_torso']:>14.6f} {r['mae_torso']:>14.6f}"
+        elif any_dual:
+            row += f" | {'-':>14s} {'-':>14s}"
+        print(row)
+
         mses.append(r["mse"])
         maes.append(r["mae"])
         all_per_dim.append(r["per_dim_mse"])
+        if "mse_torso" in r:
+            mses_t.append(r["mse_torso"])
+            maes_t.append(r["mae_torso"])
+            all_per_dim_t.append(r["per_dim_mse_torso"])
 
     if mses:
-        print(f"\n  Overall avg MSE: {np.mean(mses):.6f} (+/- {np.std(mses):.6f})")
-        print(f"  Overall avg MAE: {np.mean(maes):.6f} (+/- {np.std(maes):.6f})")
-        avg_per_dim = np.mean(all_per_dim, axis=0)
-        print(f"  Per-dim avg MSE: {np.array2string(avg_per_dim, precision=6)}")
-        print(f"  Demos evaluated: {len(mses)}")
+        print()
+        print(f"  [{primary_frame}] avg MSE: {np.mean(mses):.6f} (+/- {np.std(mses):.6f})")
+        print(f"  [{primary_frame}] avg MAE: {np.mean(maes):.6f} (+/- {np.std(maes):.6f})")
+        print(f"  [{primary_frame}] per-dim avg MSE: "
+              f"{np.array2string(np.mean(all_per_dim, axis=0), precision=6)}")
+    if mses_t:
+        print()
+        print(f"  [torso ] avg MSE: {np.mean(mses_t):.6f} (+/- {np.std(mses_t):.6f})")
+        print(f"  [torso ] avg MAE: {np.mean(maes_t):.6f} (+/- {np.std(maes_t):.6f})")
+        print(f"  [torso ] per-dim avg MSE: "
+              f"{np.array2string(np.mean(all_per_dim_t, axis=0), precision=6)}")
+    if mses:
+        print(f"\n  Demos evaluated: {len(mses)}")
 
 
 def main():
@@ -229,13 +368,34 @@ def main():
                         help="Demo indices to evaluate. Default: all demos in the dataset.")
     parser.add_argument("--num_eval_points", type=int, default=10,
                         help="Number of uniformly spaced eval points per demo.")
+    parser.add_argument("--execute_horizon", type=int, default=None,
+                        help="Passed to model.get_action() (mirrors rollout_diffusion_policy.py).")
+    parser.add_argument("--cam_actions", action="store_true",
+                        help="Policy emits camera-frame actions; inverse-transform to torso frame.")
+    parser.add_argument("--calib", type=str, default=None,
+                        help=".npz with T_base_torso, T_base_camera (overrides built-in calibration).")
+    parser.add_argument("--torso_actions_h5", type=str, default=None,
+                        help="Paired h5 with torso-frame GT actions (same demos/lengths as the main "
+                             "data h5). Use with --cam_actions to compute both before-transform "
+                             "(cam vs cam) and after-transform (torso vs torso) MSE.")
+    parser.add_argument("--data", type=str, nargs="+", default=None,
+                        help="Override config.data_config.data with these h5 paths (eval on a "
+                             "different dataset than the one the model was trained on).")
     parser.add_argument("--quiet", action="store_true",
                         help="Only print summary, not per-step details.")
     args = parser.parse_args()
 
+    if args.torso_actions_h5 is not None and not args.cam_actions:
+        print("WARNING: --torso_actions_h5 has no effect without --cam_actions; ignoring.")
+        args.torso_actions_h5 = None
+
     # Load config
     config_module = importlib.import_module(args.config)
     config = config_module.config
+
+    if args.data is not None:
+        print(f"[override] config.data_config.data -> {args.data}")
+        config.data_config.data = args.data
 
     # Find checkpoint
     ckpt_path = args.ckpt
@@ -265,6 +425,10 @@ def main():
         ckpt_path=ckpt_path,
         demo_indices=args.demos,
         num_eval_points=args.num_eval_points,
+        execute_horizon=args.execute_horizon,
+        cam_actions=args.cam_actions,
+        calib=args.calib,
+        torso_actions_h5=args.torso_actions_h5,
         verbose=not args.quiet,
     )
 

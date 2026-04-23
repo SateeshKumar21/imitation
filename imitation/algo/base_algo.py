@@ -63,21 +63,31 @@ class BaseAlgo(nn.Module):
     #     logger.log_scalar(weights.mean(), 'weights/mean_norm', step, phase)
     #     logger.log_scalar(weights.abs().max(), 'weights/max_norm', step, phase)
 
-    def save_weights(self, epoch, path):
+    def save_weights(self, epoch, path, extra_state=None):
         path = os.path.join(path, 'weights')
         os.makedirs(path, exist_ok=True)
         path = os.path.join(path, "weights_ep{}.pth".format(epoch))
 
-        model_kwargs = {'config': self.config, 'device': self.device}
-        torch.save([model_kwargs, self.state_dict()], path)
-    
+        payload = {
+            'model_kwargs': {'config': self.config, 'device': self.device},
+            'state_dict': self.state_dict(),
+            'epoch': epoch,
+        }
+        if extra_state is not None:
+            payload.update(extra_state)
+        torch.save(payload, path)
+
     @staticmethod
     def load_weights(path):
         if os.path.exists(path):
-            kwargs, state = torch.load(path, weights_only=False)
+            loaded = torch.load(path, weights_only=False)
+            if isinstance(loaded, dict) and 'model_kwargs' in loaded:
+                kwargs, state = loaded['model_kwargs'], loaded['state_dict']
+            else:
+                kwargs, state = loaded
             config = kwargs['config']
             device = kwargs['device']
-            
+
             model = config.policy_config.policy_class(config)
             model.load_state_dict(state)
             return model

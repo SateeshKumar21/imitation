@@ -39,15 +39,70 @@ class Trainer:
 
     def load_checkpoint(self, path):
         print(f"==> Resuming from checkpoint: {path}")
-        _, state = torch.load(path, weights_only=False)
-        self.model.load_state_dict(state)
-        # parse epoch from filename, e.g. weights_ep100.pth
-        basename = os.path.basename(path)
-        try:
-            self.start_epoch = int(basename.split('ep')[1].split('.')[0])
+        loaded = torch.load(path, weights_only=False)
+
+        # Legacy format: [model_kwargs, state_dict]
+        if not (isinstance(loaded, dict) and 'state_dict' in loaded):
+            print("==> WARNING: legacy checkpoint format detected; only model weights will be restored")
+            _, state = loaded
+            self.model.load_state_dict(state)
+            basename = os.path.basename(path)
+            try:
+                self.start_epoch = int(basename.split('ep')[1].split('.')[0])
+            except (IndexError, ValueError):
+                self.start_epoch = 0
             print(f"==> Resuming from epoch {self.start_epoch}")
-        except (IndexError, ValueError):
-            self.start_epoch = 0
+            return
+
+        # New dict format: full training state
+        self.model.load_state_dict(loaded['state_dict'])
+        print("==> Restored model weights")
+
+        if 'epoch' in loaded:
+            self.start_epoch = int(loaded['epoch'])
+        else:
+            basename = os.path.basename(path)
+            try:
+                self.start_epoch = int(basename.split('ep')[1].split('.')[0])
+            except (IndexError, ValueError):
+                self.start_epoch = 0
+        print(f"==> Resuming from epoch {self.start_epoch}")
+
+        if 'optimizers' in loaded and loaded['optimizers'] is not None:
+            for opt, sd in zip(self.optimizers, loaded['optimizers']):
+                opt.load_state_dict(sd)
+            print(f"==> Restored {len(self.optimizers)} optimizer(s)")
+
+        if 'lr_schedulers' in loaded and loaded['lr_schedulers'] is not None:
+            for sch, sd in zip(self.lr_schedulers, loaded['lr_schedulers']):
+                if sch is not None and sd is not None:
+                    sch.load_state_dict(sd)
+            last_step = self.lr_schedulers[0].state_dict().get('_step_count', None) if self.lr_schedulers and self.lr_schedulers[0] is not None else None
+            print(f"==> Restored lr scheduler(s) (step_count={last_step})")
+
+        if 'scaler' in loaded and loaded['scaler'] is not None and self.scaler is not None:
+            self.scaler.load_state_dict(loaded['scaler'])
+            print("==> Restored AMP GradScaler")
+
+        if 'ema' in loaded and loaded['ema'] is not None and getattr(self.model, 'use_ema', False):
+            ema_sd = loaded['ema']
+            self.model.ema.averaged_model.load_state_dict(ema_sd['averaged_model'])
+            self.model.ema.optimization_step = int(ema_sd.get('optimization_step', 0))
+            self.model.ema.decay = float(ema_sd.get('decay', 0.0))
+            print(f"==> Restored EMA (optimization_step={self.model.ema.optimization_step})")
+
+        if 'rng' in loaded and loaded['rng'] is not None:
+            rng = loaded['rng']
+            try:
+                if 'torch' in rng:
+                    torch.set_rng_state(rng['torch'])
+                if 'cuda' in rng and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all(rng['cuda'])
+                if 'numpy' in rng:
+                    np.random.set_state(rng['numpy'])
+                print("==> Restored RNG state")
+            except Exception as e:
+                print(f"==> WARNING: failed to restore RNG state: {e}")
 
     def train(self, n_epochs):
         self.model.train()
@@ -74,6 +129,11 @@ class Trainer:
                 val_info = self.validate()
                 if self.logger is not None:
                     self.logger.log_scalar_dict(val_info, step=epoch, phase='val')
+
+            if self.extra_val_loader is not None:
+                extra_info = self.extra_validate()
+                if self.logger is not None:
+                    self.logger.log_scalar_dict(extra_info, step=epoch, phase='extra_val')
                 
             if (self.evaluator is not None) and self.train_config.eval_every_n_epochs > 0 and (epoch+1) % self.train_config.eval_every_n_epochs == 0:
                 eval_info = self.evaluate()
@@ -175,6 +235,24 @@ class Trainer:
         self.model.train()
         return val_loss
 
+    def extra_validate(self):
+        """Compute loss over the external (held-out) dataset. Accumulated across
+        all batches. Logged under phase='extra_val'."""
+        self.model.eval()
+        agg = AttrDict()
+        n_batches = len(self.extra_val_loader)
+        with torch.no_grad():
+            for batch in self.extra_val_loader:
+                batch = recursive_dict_list_tuple_apply(batch, {torch.Tensor: lambda x: x.to(DEVICE, non_blocking=True).float()})
+                batch['obs'] = process_obs_dict(batch['obs'], self.obs_key_to_modality)
+                losses = self.model.compute_loss(batch)
+                for k in losses:
+                    if k not in agg:
+                        agg[k] = 0
+                    agg[k] += float(losses[k].item()) / n_batches
+        self.model.train()
+        return agg
+
     def evaluate(self):
         print("\nEvaluating policy...")
         return self.evaluator.evaluate(self.model)
@@ -193,7 +271,28 @@ class Trainer:
     def save_checkpoint(self, epoch):
         if self.log_path is not None:
             print(f"==> Saving checkpoint at epoch {epoch}")
-            self.model.save_weights(epoch, self.log_path)
+            extra_state = {
+                'optimizers': [opt.state_dict() for opt in self.optimizers],
+                'lr_schedulers': [
+                    sch.state_dict() if sch is not None else None
+                    for sch in self.lr_schedulers
+                ],
+                'scaler': self.scaler.state_dict() if self.scaler is not None else None,
+                'ema': (
+                    {
+                        'averaged_model': self.model.ema.averaged_model.state_dict(),
+                        'optimization_step': self.model.ema.optimization_step,
+                        'decay': self.model.ema.decay,
+                    }
+                    if getattr(self.model, 'use_ema', False) else None
+                ),
+                'rng': {
+                    'torch': torch.get_rng_state(),
+                    'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                    'numpy': np.random.get_state(),
+                },
+            }
+            self.model.save_weights(epoch, self.log_path, extra_state=extra_state)
 
     def visualize_training_images(self, epoch):
         """Save a grid of training images (original vs augmented) to disk."""
@@ -280,7 +379,23 @@ class Trainer:
                                 obs_keys_to_normalize=self.observation_config.obs_keys_to_normalize,
                                 split='val',
                                 **self.data_config.dataset_kwargs)
-            
+
+        # Optional on-the-fly evaluation on an external dataset (e.g. real data
+        # while training on gen data). Logs as `extra_val/*` every epoch when set.
+        self.extra_val_dataset = None
+        extra_val_data = getattr(self.data_config, 'extra_val_data', None)
+        if extra_val_data:
+            from imitation.data.dataset import SequenceDataset
+            extra_kwargs = dict(self.data_config.dataset_kwargs)
+            extra_kwargs.pop('target_prob', None)  # only used by WeightedMultiDataset
+            self.extra_val_dataset = SequenceDataset(
+                data_paths=extra_val_data,
+                obs_keys_to_modality=self.obs_key_to_modality,
+                obs_keys_to_normalize=self.observation_config.obs_keys_to_normalize,
+                split='train',  # use full set; this data is held out from training
+                **extra_kwargs,
+            )
+
         self.setup_dataloader()
     
     def setup_dataloader(self):
@@ -298,6 +413,17 @@ class Trainer:
                                 self.val_dataset,
                                 batch_size=self.train_config.batch_size,
                                 shuffle=True,
+                                num_workers=self.data_config.num_workers,
+                                pin_memory=True,
+                                persistent_workers=self.data_config.num_workers > 0,
+                                prefetch_factor=2 if self.data_config.num_workers > 0 else None)
+
+        self.extra_val_loader = None
+        if self.extra_val_dataset is not None:
+            self.extra_val_loader = DataLoader(
+                                self.extra_val_dataset,
+                                batch_size=self.train_config.batch_size,
+                                shuffle=False,
                                 num_workers=self.data_config.num_workers,
                                 pin_memory=True,
                                 persistent_workers=self.data_config.num_workers > 0,

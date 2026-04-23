@@ -12,8 +12,10 @@ import h5py
 import sys
 TELEMOMA_PATH = "/telemoma/telmoma-sateesh/telemoma"
 IK_PATH = "/telemoma/tracikpy"
+ACTION_TRANSFORM_PATH = "/home/ec2-user/action-transformation"
 sys.path.insert(0, str(TELEMOMA_PATH))
 sys.path.insert(0, str(IK_PATH))
+sys.path.insert(0, str(ACTION_TRANSFORM_PATH))
 
 from telemoma.robot_interface.tiago.tiago_gym import TiagoGym
 from telemoma.robot_interface.tiago.head import LookAtFixedPoint
@@ -25,6 +27,23 @@ from imitation.algo.diffusion_policy import DiffusionPolicy
 from telemoma.configs.zed_vr import teleop_config
 #from gymnasium.wrappers import FrameStackObservation
 import torch
+
+from calibration import T_BASE_TORSO, T_BASE_CAMERA
+from transform_il_data_to_camera_frame import invert_transform
+from inverse_transform_actions import inverse_transform_actions
+
+
+def _load_cam_torso_transform(calib_npz=None):
+    """Return T_cam_torso used to inverse-transform camera-frame policy actions."""
+    if calib_npz is not None:
+        d = np.load(calib_npz)
+        T_base_torso = np.asarray(d["T_base_torso"], dtype=np.float64)
+        T_base_camera = np.asarray(d["T_base_camera"], dtype=np.float64)
+    else:
+        T_base_torso = T_BASE_TORSO.copy()
+        T_base_camera = T_BASE_CAMERA.copy()
+    T_cam_base = invert_transform(T_base_camera)
+    return T_cam_base @ T_base_torso
 
 
 def _crop_and_resize(img, size=224):
@@ -67,7 +86,8 @@ def _make_save_path(save_dir):
 
 
 SINGLE_HAND=True
-def rollout_policy(model_ckpt, save_vid=False, vid_name=None, out_dir="./", save_dir=None, execute_horizon=None):
+def rollout_policy(model_ckpt, save_vid=False, vid_name=None, out_dir="./", save_dir=None,
+                   execute_horizon=None, cam_actions=False, calib=None):
 
     # load policy
     os.makedirs(out_dir, exist_ok=True)
@@ -77,6 +97,11 @@ def rollout_policy(model_ckpt, save_vid=False, vid_name=None, out_dir="./", save
     save_path = _make_save_path(save_dir) if save_dir is not None else None
     model = DiffusionPolicy.load_weights(model_ckpt)
     model.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+
+    T_cam_torso = _load_cam_torso_transform(calib) if cam_actions else None
+    if cam_actions:
+        print(f"[cam_actions] inverse-transforming camera-frame policy actions to torso frame "
+              f"(calib={'builtin' if calib is None else calib})")
 
     env = TiagoGym(
             frequency=10,
@@ -224,6 +249,9 @@ def rollout_policy(model_ckpt, save_vid=False, vid_name=None, out_dir="./", save
             obs['tiago_head_image'] = img
             policy_action = model.get_action(obs, batched=False, execute_horizon=execute_horizon).reshape(-1,)
 
+            if cam_actions:
+                policy_action = inverse_transform_actions(policy_action[None, :], T_cam_torso)[0].astype(policy_action.dtype)
+
             # Save preprocessed image as (3, 224, 224)
             raw_obs['tiago_head_image_preprocessed'] = img.transpose(2, 0, 1)
 
@@ -291,6 +319,11 @@ if __name__=='__main__':
     parser.add_argument("--out_dir", required=True, default="./", type=str, help="output directory for video")
     parser.add_argument("--save_dir", default=None, type=str, help="directory to save rollout data as HDF5")
     parser.add_argument("--execute_horizon", default=None, type=int, help="number of actions to execute before replanning (default: use all predicted actions)")
+    parser.add_argument("--cam_actions", action="store_true",
+                        help="policy emits camera-frame actions; apply inverse transform to torso frame before execution.")
+    parser.add_argument("--calib", default=None, type=str,
+                        help=".npz with T_base_torso, T_base_camera for --cam_actions. Default: built-in constants in action-transformation/calibration.py.")
     args = parser.parse_args()
 
-    rollout_policy(args.ckpt, args.save_vid, args.vid_name, args.out_dir, args.save_dir, args.execute_horizon)
+    rollout_policy(args.ckpt, args.save_vid, args.vid_name, args.out_dir, args.save_dir,
+                   args.execute_horizon, args.cam_actions, args.calib)
