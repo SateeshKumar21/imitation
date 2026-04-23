@@ -176,7 +176,7 @@ class DiffusionPolicy(BaseAlgo):
         return obs
 
     @torch.no_grad()
-    def get_action(self, obs, batched=False):
+    def get_action(self, obs, batched=False, execute_horizon=None):
         '''
             obs expected to have no time dimension
         '''
@@ -217,6 +217,11 @@ class DiffusionPolicy(BaseAlgo):
         pred_action = self.nets["normalizer"].unnormalize_by_key(pred_action, 'actions')
         pred_action = pred_action.permute(1, 0, 2)  # (B, action_dim, n_action_steps)
         self.action_queue.extend(pred_action.cpu().numpy())
+
+        # Receding horizon: keep only the first `execute_horizon` actions
+        if execute_horizon is not None:
+            while len(self.action_queue) > execute_horizon:
+                self.action_queue.pop()
 
         self.train()
         action = self.action_queue.popleft()
