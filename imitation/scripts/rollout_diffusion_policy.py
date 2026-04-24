@@ -29,12 +29,12 @@ from telemoma.configs.zed_vr import teleop_config
 import torch
 
 from calibration import T_BASE_TORSO, T_BASE_CAMERA
-from transform_il_data_to_camera_frame import invert_transform
+from transform_il_data_to_camera_frame import invert_transform, transform_eef_pose
 from inverse_transform_actions import inverse_transform_actions
 
 
-def _load_cam_torso_transform(calib_npz=None):
-    """Return T_cam_torso used to inverse-transform camera-frame policy actions."""
+def _load_cam_transforms(calib_npz=None):
+    """Return (T_cam_base, T_cam_torso) used for cam-frame obs/action transforms."""
     if calib_npz is not None:
         d = np.load(calib_npz)
         T_base_torso = np.asarray(d["T_base_torso"], dtype=np.float64)
@@ -43,7 +43,8 @@ def _load_cam_torso_transform(calib_npz=None):
         T_base_torso = T_BASE_TORSO.copy()
         T_base_camera = T_BASE_CAMERA.copy()
     T_cam_base = invert_transform(T_base_camera)
-    return T_cam_base @ T_base_torso
+    T_cam_torso = T_cam_base @ T_base_torso
+    return T_cam_base, T_cam_torso
 
 
 def _crop_and_resize(img, size=224):
@@ -98,9 +99,11 @@ def rollout_policy(model_ckpt, save_vid=False, vid_name=None, out_dir="./", save
     model = DiffusionPolicy.load_weights(model_ckpt)
     model.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
-    T_cam_torso = _load_cam_torso_transform(calib) if cam_actions else None
+    T_cam_base = T_cam_torso = None
     if cam_actions:
-        print(f"[cam_actions] inverse-transforming camera-frame policy actions to torso frame "
+        T_cam_base, T_cam_torso = _load_cam_transforms(calib)
+        print(f"[cam_actions] transforming obs/left,obs/right base->camera and "
+              f"inverse-transforming camera-frame policy actions to torso frame "
               f"(calib={'builtin' if calib is None else calib})")
 
     env = TiagoGym(
@@ -241,12 +244,20 @@ def rollout_policy(model_ckpt, save_vid=False, vid_name=None, out_dir="./", save
                 print("Should not be here after termination")
                 import pdb; pdb.set_trace()
             print("Using policy")
-            # Keep raw obs for saving before preprocessing
+            # Keep raw obs for saving before preprocessing (stays in base frame).
             raw_obs = {k: obs[k] for k in obs_keys_to_save if k in obs}
 
             img = _crop_and_resize(obs['tiago_head_image']).astype(np.uint8)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             obs['tiago_head_image'] = img
+
+            if cam_actions:
+                for arm in ('left', 'right'):
+                    if arm in obs:
+                        arr = np.asarray(obs[arm]).reshape(1, -1)
+                        if arr.shape[1] == 8:
+                            obs[arm] = transform_eef_pose(arr, T_cam_base)[0].astype(np.asarray(obs[arm]).dtype)
+
             policy_action = model.get_action(obs, batched=False, execute_horizon=execute_horizon).reshape(-1,)
 
             if cam_actions:
