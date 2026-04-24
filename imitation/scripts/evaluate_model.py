@@ -49,10 +49,11 @@ if ACTION_TRANSFORM_PATH not in sys.path:
 from calibration import T_BASE_TORSO, T_BASE_CAMERA
 from transform_il_data_to_camera_frame import invert_transform
 from inverse_transform_actions import inverse_transform_actions
+from transform_il_data_to_camera_frame import transform_eef_pose
 
 
-def _load_cam_torso_transform(calib_npz=None):
-    """Return T_cam_torso used to inverse-transform camera-frame policy actions."""
+def _load_cam_transforms(calib_npz=None):
+    """Return (T_cam_base, T_cam_torso) for cam-frame obs/action transforms."""
     if calib_npz is not None:
         d = np.load(calib_npz)
         T_base_torso = np.asarray(d["T_base_torso"], dtype=np.float64)
@@ -61,7 +62,8 @@ def _load_cam_torso_transform(calib_npz=None):
         T_base_torso = T_BASE_TORSO.copy()
         T_base_camera = T_BASE_CAMERA.copy()
     T_cam_base = invert_transform(T_base_camera)
-    return T_cam_base @ T_base_torso
+    T_cam_torso = T_cam_base @ T_base_torso
+    return T_cam_base, T_cam_torso
 
 
 def find_checkpoint(experiment_dir, epoch=None):
@@ -165,9 +167,9 @@ def evaluate(config, ckpt_path, demo_indices, num_eval_points,
     if isinstance(data_paths, str):
         data_paths = [data_paths]
 
-    T_cam_torso = None
+    T_cam_base = T_cam_torso = None
     if cam_actions:
-        T_cam_torso = _load_cam_torso_transform(calib)
+        T_cam_base, T_cam_torso = _load_cam_transforms(calib)
         if verbose:
             print(f"[cam_actions] inverse-transforming camera-frame policy actions to torso frame "
                   f"(calib={'builtin' if calib is None else calib})")
@@ -184,6 +186,17 @@ def evaluate(config, ckpt_path, demo_indices, num_eval_points,
             hdf5 = h5py.File(data_path, "r")
             available_demos = list_demos(hdf5)
             available_indices = [int(d.split("_")[-1]) for d in available_demos]
+
+            # Decide once per h5 whether obs need on-the-fly base->camera transformation.
+            h5_frame = hdf5.attrs.get("frame")
+            if isinstance(h5_frame, bytes):
+                h5_frame = h5_frame.decode()
+            transform_obs = cam_actions and h5_frame != "camera"
+            if verbose:
+                if transform_obs:
+                    print(f"[cam_obs] transforming obs/left,obs/right base->camera for {data_path}")
+                elif cam_actions:
+                    print(f"[cam_obs] {data_path} already in camera frame (frame attr); obs passthrough")
 
             if demo_indices is not None:
                 run_indices = [i for i in demo_indices if i in available_indices]
@@ -229,7 +242,10 @@ def evaluate(config, ckpt_path, demo_indices, num_eval_points,
                     for t in range(window_start, target_idx + 1):
                         obs = {}
                         for key in obs_keys:
-                            obs[key] = np.array(demo[f"obs/{key}"][t])
+                            val = np.array(demo[f"obs/{key}"][t])
+                            if transform_obs and key in ("left", "right") and val.shape == (8,):
+                                val = transform_eef_pose(val.reshape(1, -1), T_cam_base)[0].astype(val.dtype)
+                            obs[key] = val
                         with torch.no_grad():
                             action = model.get_action(obs, batched=False,
                                                       execute_horizon=execute_horizon)
