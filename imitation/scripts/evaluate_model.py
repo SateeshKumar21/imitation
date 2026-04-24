@@ -192,6 +192,10 @@ def evaluate(config, ckpt_path, demo_indices, num_eval_points,
             if isinstance(h5_frame, bytes):
                 h5_frame = h5_frame.decode()
             transform_obs = cam_actions and h5_frame != "camera"
+            if os.environ.get("EVAL_DISABLE_OBS_TRANSFORM") == "1":
+                transform_obs = False
+                if verbose:
+                    print(f"[cam_obs] EVAL_DISABLE_OBS_TRANSFORM=1 -> forcing obs passthrough for {data_path}")
             if verbose:
                 if transform_obs:
                     print(f"[cam_obs] transforming obs/left,obs/right base->camera for {data_path}")
