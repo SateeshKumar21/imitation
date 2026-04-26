@@ -13,9 +13,12 @@ import sys
 TELEMOMA_PATH = "/telemoma/telmoma-sateesh/telemoma"
 IK_PATH = "/telemoma/tracikpy"
 ACTION_TRANSFORM_PATH = "/home/ec2-user/action-transformation"
+FK_PATH = "/home/ec2-user/3dmoma-action-generation"
+CAM_OFFSET_JSON_DEFAULT = "/home/ec2-user/3dmoma-action-generation/cam_offset_26th_feb.json"
 sys.path.insert(0, str(TELEMOMA_PATH))
 sys.path.insert(0, str(IK_PATH))
 sys.path.insert(0, str(ACTION_TRANSFORM_PATH))
+sys.path.insert(0, str(FK_PATH))
 
 from telemoma.robot_interface.tiago.tiago_gym import TiagoGym
 from telemoma.robot_interface.tiago.head import LookAtFixedPoint
@@ -31,17 +34,41 @@ import torch
 from calibration import T_BASE_TORSO, T_BASE_CAMERA
 from transform_il_data_to_camera_frame import invert_transform, transform_eef_pose
 from inverse_transform_actions import inverse_transform_actions
+from head_fk import t_base_camera as fk_t_base_camera
 
 
 def _load_cam_transforms(calib_npz=None):
-    """Return (T_cam_base, T_cam_torso) used for cam-frame obs/action transforms."""
+    """Return (T_base_torso, cam_offset_json) used for per-frame cam-frame obs/action transforms.
+
+    Static T_BASE_CAMERA from calibration.py is no longer used at rollout —
+    T_base_camera is rebuilt every step from current head joints via head_fk
+    (mirrors transform_il_data_to_camera_frame.compute_per_frame_T_base_camera).
+    """
     if calib_npz is not None:
         d = np.load(calib_npz)
         T_base_torso = np.asarray(d["T_base_torso"], dtype=np.float64)
-        T_base_camera = np.asarray(d["T_base_camera"], dtype=np.float64)
+        cam_offset_json = str(d["cam_offset_json"]) if "cam_offset_json" in d.files else CAM_OFFSET_JSON_DEFAULT
     else:
         T_base_torso = T_BASE_TORSO.copy()
-        T_base_camera = T_BASE_CAMERA.copy()
+        cam_offset_json = CAM_OFFSET_JSON_DEFAULT
+    return T_base_torso, cam_offset_json
+
+
+def _compute_cam_transforms_from_obs(obs, T_base_torso, torso=0.2,
+                                     cam_offset_json=CAM_OFFSET_JSON_DEFAULT):
+    """Per-frame (T_cam_base, T_cam_torso) from head joints in obs.
+
+    Mirrors transform_il_data_to_camera_frame.compute_per_frame_T_base_camera
+    for one rollout step: reads [head_1, head_2] from obs['head_joints'] and
+    runs head_fk.t_base_camera with the given torso lift (default 0.2 m).
+    """
+    hj = np.asarray(obs['head_joints'], dtype=np.float64).reshape(-1)
+    if hj.size != 2:
+        raise ValueError(f"obs['head_joints'] must have 2 elements; got shape {hj.shape}")
+    T_base_camera = fk_t_base_camera(
+        float(hj[0]), float(hj[1]), float(torso),
+        cam_offset_json=cam_offset_json,
+    )
     T_cam_base = invert_transform(T_base_camera)
     T_cam_torso = T_cam_base @ T_base_torso
     return T_cam_base, T_cam_torso
@@ -99,12 +126,13 @@ def rollout_policy(model_ckpt, save_vid=False, vid_name=None, out_dir="./", save
     model = DiffusionPolicy.load_weights(model_ckpt)
     model.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
-    T_cam_base = T_cam_torso = None
+    T_base_torso = cam_offset_json = None
     if cam_actions:
-        T_cam_base, T_cam_torso = _load_cam_transforms(calib)
-        print(f"[cam_actions] transforming obs/left,obs/right base->camera and "
-              f"inverse-transforming camera-frame policy actions to torso frame "
-              f"(calib={'builtin' if calib is None else calib})")
+        T_base_torso, cam_offset_json = _load_cam_transforms(calib)
+        print(f"[cam_actions] per-frame head-FK: transforming obs/left,obs/right "
+              f"base->camera and inverse-transforming camera-frame policy actions "
+              f"to torso frame (calib={'builtin' if calib is None else calib}, "
+              f"cam_offset_json={cam_offset_json}, torso=0.2)")
 
     env = TiagoGym(
             frequency=10,
@@ -251,7 +279,11 @@ def rollout_policy(model_ckpt, save_vid=False, vid_name=None, out_dir="./", save
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             obs['tiago_head_image'] = img
 
+            T_cam_base = T_cam_torso = None
             if cam_actions:
+                T_cam_base, T_cam_torso = _compute_cam_transforms_from_obs(
+                    obs, T_base_torso, torso=0.2, cam_offset_json=cam_offset_json,
+                )
                 for arm in ('left', 'right'):
                     if arm in obs:
                         arr = np.asarray(obs[arm]).reshape(1, -1)

@@ -402,13 +402,16 @@ class SequenceDataset(torch.utils.data.Dataset):
 class WeightedMultiDataset(SequenceDataset):
     def __init__(
         self,
-        data_paths,  # First path is real data; remaining are gen data
+        data_paths,  # Files [0:num_target_files] are the target pool; rest are the other pool
         obs_keys_to_modality,
         dataset_keys,
-        target_prob=0.5,  # Probability of sampling from the first (real) file
+        target_prob=0.5,  # Probability of sampling from the target pool
+        num_target_files=1,  # How many leading paths form the target (real) pool
         **kwargs
     ):
         assert len(data_paths) >= 2, "This class expects at least two HDF5 file paths."
+        assert 1 <= num_target_files < len(data_paths), \
+            f"num_target_files must be in [1, {len(data_paths)-1}], got {num_target_files}"
 
         super().__init__(
             data_paths=data_paths,
@@ -418,10 +421,11 @@ class WeightedMultiDataset(SequenceDataset):
         )
 
         self.target_prob = target_prob
+        self.num_target_files = num_target_files
 
         # Split each file's indices independently at 95% so each file always
         # contributes val samples regardless of its size relative to the others.
-        # file_id=0 is real data; all others (file_id>=1) form a combined gen pool.
+        # Files [0:num_target_files] form the target (real) pool; the rest form the gen pool.
         per_file_train = []
         per_file_val = []
         num_files = len(data_paths)
@@ -431,15 +435,16 @@ class WeightedMultiDataset(SequenceDataset):
             per_file_train.append(all_idx[:train_end])
             per_file_val.append(all_idx[train_end:])
 
+        n = num_target_files
         if self.split == 'train':
-            self.real_indices = per_file_train[0]
-            self.gen_indices = [i for sub in per_file_train[1:] for i in sub]
+            self.real_indices = [i for sub in per_file_train[:n] for i in sub]
+            self.gen_indices = [i for sub in per_file_train[n:] for i in sub]
         elif self.split == 'val':
-            self.real_indices = per_file_val[0]
-            self.gen_indices = [i for sub in per_file_val[1:] for i in sub]
+            self.real_indices = [i for sub in per_file_val[:n] for i in sub]
+            self.gen_indices = [i for sub in per_file_val[n:] for i in sub]
         else:
-            self.real_indices = per_file_train[0] + per_file_val[0]
-            self.gen_indices = [i for sub in (per_file_train[1:] + per_file_val[1:]) for i in sub]
+            self.real_indices = [i for sub in (per_file_train[:n] + per_file_val[:n]) for i in sub]
+            self.gen_indices = [i for sub in (per_file_train[n:] + per_file_val[n:]) for i in sub]
 
     def __getitem__(self, index):
         """
